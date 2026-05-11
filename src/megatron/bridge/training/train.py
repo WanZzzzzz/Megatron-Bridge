@@ -452,6 +452,7 @@ def train(
             pg_collection,
             forward_backward_func,
             p2p_communicator,
+            is_first_iteration=global_state.train_state.step == start_iteration,
         )
 
         fault_tolerance.on_training_step_end(global_state)
@@ -765,6 +766,7 @@ def train_step(
     pg_collection: ProcessGroupCollection,
     forward_backward_func: Callable,
     p2p_communicator: P2PCommunicator,
+    is_first_iteration: bool = False,
 ) -> tuple[dict[str, torch.Tensor], int, bool, bool, int, Optional[float], Optional[int]]:
     """Single training step.
 
@@ -777,6 +779,8 @@ def train_step(
         global_state: Global training state
         pg_collection: Process group collection
         forward_backward_func: forward-backward function
+        is_first_iteration: Whether this is the first attempted train step after
+            setup/checkpoint load.
 
     Returns:
         tuple containing:
@@ -806,7 +810,7 @@ def train_step(
             optimizer=optimizer,
             model=model,
             reuse_grad_buf_for_mxfp8_param_ag=cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag,
-            overlap_param_gather=cfg.ddp.overlap_param_gather,
+            is_first_iteration=is_first_iteration,
         )
 
         # Handle finetuning vs pretraining data consumption
@@ -1535,40 +1539,39 @@ def _handle_mxfp8_param_buffer_copy(
     optimizer: MegatronOptimizer,
     model: list[MegatronModule],
     reuse_grad_buf_for_mxfp8_param_ag: bool,
-    overlap_param_gather: bool,
+    is_first_iteration: bool,
 ) -> None:
     """Copy main params to param buffer for mxfp8 with grad buffer reuse.
 
-    For mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
-    we need to call _copy_main_params_to_param_buffer() after the grad buffer
-    is zeroed because param and grad buffer are shared.
+    For mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag, we need to call
+    _copy_main_params_to_param_buffer() after the grad buffer is zeroed because
+    param and grad buffer are shared.
 
-    However, we should skip this on the first iteration when forward_pre_hook is disabled,
-    because:
+    However, we should skip this on the first iteration, because:
     1. The first iteration's params are already in param.data (from init or checkpoint).
-    2. Without forward_pre_hook, finish_param_sync() won't be called to zero the grad buffer,
-       so the main grads will be polluted by the main params.
+    2. Both start_param_sync (without overlap) and finish_param_sync (with overlap) will not be called during the first iteration, 
+       hence the grad buffer will not be zeroed, causing the main grads to be polluted by the main params.
 
-    Exception: when a full-iteration CUDA graph has been captured, the all-gather
-    and subsequent param_data zero are baked into the graph and replay
-    unconditionally. We must populate param_data so the replayed AG gathers
-    correct weights, even when forward pre-hooks are disabled (first iteration).
+    Exception: when a full-iteration CUDA graph has been captured during warmup, the all-gather
+    and subsequent param_data zero are baked into the graph and replay unconditionally. 
+    So even in the first iteration, we must populate param_data so the replayed AG gathers
+    correct weights.
 
     Args:
         optimizer: The MegatronOptimizer instance
         model: List of model chunks (MegatronModule instances)
         reuse_grad_buf_for_mxfp8_param_ag: Config flag for grad buffer reuse
-        overlap_param_gather: Config flag for overlapping param gathering
+        is_first_iteration: Whether this is the first attempted train step after
+            setup/checkpoint load.
     """
-    if reuse_grad_buf_for_mxfp8_param_ag and overlap_param_gather:
-        # Check if forward_pre_hook is enabled by checking if hooks are registered.
-        forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
+    if reuse_grad_buf_for_mxfp8_param_ag:
         full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
-        if forward_pre_hook_enabled or full_cg_captured:
-            for optim_instance in optimizer.chained_optimizers:
-                if isinstance(optim_instance, DistributedOptimizer):
-                    optim_instance._copy_main_params_to_param_buffer()
+        if is_first_iteration and not full_cg_captured:
+            return
 
+        for optim_instance in optimizer.chained_optimizers:
+            if isinstance(optim_instance, DistributedOptimizer):
+                optim_instance._copy_main_params_to_param_buffer()
 
 def _delete_cuda_graphs(cuda_graph_helper: TECudaGraphHelper):
     """
